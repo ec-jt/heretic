@@ -28,7 +28,19 @@ from rich.console import Console
 
 from .config import DatasetSpecification, Settings
 
-print = Console(highlight=False).print
+_console = Console(highlight=False)
+
+
+def print(*args: Any, **kwargs: Any):
+    # Keep logs readable under torchrun by defaulting to rank-0 output only.
+    # Set HERETIC_PRINT_ALL_RANKS=1 to opt into per-rank logging.
+    if os.getenv("HERETIC_PRINT_ALL_RANKS") == "1":
+        _console.print(*args, **kwargs)
+        return
+
+    rank = int(os.getenv("RANK", "0"))
+    if rank == 0:
+        _console.print(*args, **kwargs)
 
 
 def print_memory_usage():

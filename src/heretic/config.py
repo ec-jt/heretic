@@ -122,8 +122,85 @@ class Settings(BaseSettings):
         description='Maximum memory to allocate per device (e.g., {"0": "20GB", "cpu": "64GB"}).',
     )
 
+    distributed: bool = Field(
+        default=False,
+        description=(
+            "Enable distributed runtime. This is auto-enabled when launched with torchrun "
+            "(WORLD_SIZE > 1)."
+        ),
+    )
+
+    distributed_backend: str = Field(
+        default="nccl",
+        description="torch.distributed backend used for process group initialization.",
+    )
+
+    distributed_world_size: int = Field(
+        default=1,
+        description=(
+            "World size for distributed runs. This value is overwritten by WORLD_SIZE when "
+            "running under torchrun."
+        ),
+    )
+
+    distributed_rank: int = Field(
+        default=0,
+        description=(
+            "Global rank for distributed runs. This value is overwritten by RANK when "
+            "running under torchrun."
+        ),
+    )
+
+    distributed_local_rank: int = Field(
+        default=0,
+        description=(
+            "Local rank (GPU index on the current node) for distributed runs. This value "
+            "is overwritten by LOCAL_RANK when running under torchrun."
+        ),
+    )
+
+    distributed_master_addr: str = Field(
+        default="127.0.0.1",
+        description=(
+            "Master node address used to initialize the process group. Overwritten by "
+            "MASTER_ADDR when running under torchrun."
+        ),
+    )
+
+    distributed_master_port: int = Field(
+        default=29500,
+        description=(
+            "Master node port used to initialize the process group. Overwritten by "
+            "MASTER_PORT when running under torchrun."
+        ),
+    )
+
+    tensor_parallel: bool = Field(
+        default=False,
+        description=(
+            "Enable tensor/model parallel model loading for distributed inference. "
+            "Recommended for very large models (e.g., Kimi-K2.5)."
+        ),
+    )
+
+    tensor_parallel_plan: str | None = Field(
+        default="auto",
+        description=(
+            'Tensor parallel plan forwarded to Transformers from_pretrained (e.g., "auto"). '
+            "Set to null to disable passing a tp_plan argument."
+        ),
+    )
+
+    cuda_alloc_conf: str | None = Field(
+        default="expandable_segments:True",
+        description=(
+            "Value to set for PYTORCH_CUDA_ALLOC_CONF/PYTORCH_ALLOC_CONF when unset. "
+            "Use null to leave allocator config unchanged."
+        ),
+    )
+
     trust_remote_code: bool | None = Field(
-        default=None,
+        default=True,
         description="Whether to trust remote code when loading the model.",
     )
 

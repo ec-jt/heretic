@@ -27,6 +27,35 @@ device_map = "auto"
 # Maximum memory to allocate per device.
 # max_memory = {"0": "20GB", "cpu": "64GB"}
 
+# Enable distributed runtime. This is auto-enabled when launched with torchrun
+# (WORLD_SIZE > 1).
+distributed = false
+
+# torch.distributed backend used for process group initialization.
+distributed_backend = "nccl"
+
+# Distributed runtime metadata. In torchrun mode, these are overwritten by
+# environment variables (WORLD_SIZE/RANK/LOCAL_RANK/MASTER_ADDR/MASTER_PORT).
+distributed_world_size = 1
+distributed_rank = 0
+distributed_local_rank = 0
+distributed_master_addr = "127.0.0.1"
+distributed_master_port = 29500
+
+# Enable tensor/model parallel model loading for large checkpoints.
+tensor_parallel = false
+
+# Tensor-parallel plan forwarded to Transformers from_pretrained.
+# Set to null to avoid passing tp_plan.
+tensor_parallel_plan = "auto"
+
+# Value used for PYTORCH_ALLOC_CONF/PYTORCH_CUDA_ALLOC_CONF when neither is set.
+# Set to null to leave allocator config unchanged.
+cuda_alloc_conf = "expandable_segments:True"
+
+# Whether to trust custom model code from Hugging Face repositories.
+trust_remote_code = true
+
 # Number of input sequences to process in parallel (0 = auto).
 batch_size = 0  # auto
 

@@ -105,6 +105,51 @@ After Heretic has finished decensoring a model, you are given the option to
 save the model, upload it to Hugging Face, chat with it to test how well it works,
 or any combination of those actions.
 
+### Multi-node distributed runs (torchrun)
+
+Heretic now supports distributed launches for very large checkpoints using
+`torchrun`. Distributed mode is enabled automatically when `WORLD_SIZE > 1`.
+
+For large models that require tensor/model parallel sharding, set the following
+options in `config.toml` (see [`config.default.toml`](config.default.toml)):
+
+```
+distributed = true
+distributed_backend = "nccl"
+tensor_parallel = true
+tensor_parallel_plan = "auto"
+cuda_alloc_conf = "expandable_segments:True"
+```
+
+Single-node example (8 GPUs):
+
+```
+torchrun --standalone --nproc-per-node=8 -m heretic.main --model moonshotai/Kimi-K2.5
+```
+
+Multi-node example (32 GPUs total, 4 nodes × 8 GPUs):
+
+Node 0:
+
+```
+torchrun \
+  --nnodes=4 \
+  --nproc-per-node=8 \
+  --node-rank=0 \
+  --master-addr=10.0.0.1 \
+  --master-port=29500 \
+  -m heretic.main --model moonshotai/Kimi-K2.5
+```
+
+Node 1/2/3: use the same command, changing only `--node-rank` to `1`, `2`, or `3`.
+
+Notes:
+
+* In distributed mode, Heretic suppresses duplicate logs from non-zero ranks by default.
+  Set `HERETIC_PRINT_ALL_RANKS=1` to enable per-rank logs.
+* Interactive post-optimization actions (save/upload/chat/benchmark menu) are disabled
+  in distributed mode. Run single-process for those actions after selecting parameters.
+
 
 ## Research features
 

@@ -2,6 +2,8 @@
 # Copyright (C) 2025-2026  Philipp Emanuel Weidmann <pew@worldwidemann.com> + contributors
 
 import math
+import importlib
+import os
 from contextlib import suppress
 from dataclasses import dataclass
 from typing import Any, Type, cast
@@ -15,6 +17,7 @@ from peft.tuners.lora.layer import Linear
 from torch import FloatTensor, LongTensor, Tensor
 from torch.nn import Module, ModuleList
 from transformers import (
+    AutoConfig,
     AutoModelForCausalLM,
     AutoModelForImageTextToText,
     AutoTokenizer,
@@ -25,12 +28,85 @@ from transformers import (
     PreTrainedTokenizerBase,
     TextStreamer,
 )
+from transformers import utils as transformers_utils
+from transformers.utils import import_utils as transformers_import_utils
 from transformers.generation import (
     GenerateDecoderOnlyOutput,  # ty:ignore[possibly-missing-import]
 )
 
 from .config import QuantizationMethod, RowNormalization, Settings
+from .distributed import DistributedState
 from .utils import Prompt, batchify, empty_cache, print
+
+
+# Some remote model repositories (including Kimi-K2.5) import helper symbols
+# that only exist in newer Transformers builds.
+# Provide a compatibility shim so those imports succeed on 5.4.x.
+if not hasattr(transformers_utils, "is_flash_attn_greater_or_equal_2_10"):
+    def _is_flash_attn_greater_or_equal_2_10() -> bool:
+        return False
+
+    setattr(
+        transformers_utils,
+        "is_flash_attn_greater_or_equal_2_10",
+        _is_flash_attn_greater_or_equal_2_10,
+    )
+
+if not hasattr(transformers_import_utils, "is_torch_fx_available"):
+    def _is_torch_fx_available() -> bool:
+        with suppress(Exception):
+            import torch.fx  # noqa: F401
+
+            return True
+        return False
+
+    setattr(
+        transformers_import_utils,
+        "is_torch_fx_available",
+        _is_torch_fx_available,
+    )
+
+
+def _patch_compressed_tensors_quantizer_for_kimi():
+    """Skip compressed-tensors recompression for Kimi checkpoints at load time."""
+    with suppress(Exception):
+        from transformers.quantizers.quantizer_compressed_tensors import (
+            CompressedTensorsHfQuantizer,
+        )
+
+        if getattr(CompressedTensorsHfQuantizer, "_heretic_kimi_skip_compress", False):
+            return
+
+        def _patched_process_model_before_weight_loading(self, model, **kwargs):
+            from compressed_tensors.quantization import apply_quantization_config
+
+            ct_quantization_config = self.compressor.quantization_config
+
+            # Initialize wrappers exactly like upstream implementation.
+            apply_quantization_config(model, ct_quantization_config, self.run_compressed)
+
+            model_config = getattr(model, "config", None)
+            is_kimi = getattr(model_config, "model_type", None) == "kimi_k25"
+            with suppress(Exception):
+                is_kimi = is_kimi or (
+                    getattr(model_config.text_config, "model_type", None) == "kimi_k2"
+                )
+
+            # Upstream path calls compress_model() for compressed checkpoints.
+            # Skip this for Kimi to avoid redundant/unstable recompression.
+            if is_kimi:
+                return
+
+            if (
+                self.quantization_config.is_quantization_compressed
+                or self.quantization_config.is_sparsification_compressed
+            ):
+                self.compressor.compress_model(model=model)
+
+        CompressedTensorsHfQuantizer._process_model_before_weight_loading = (
+            _patched_process_model_before_weight_loading
+        )
+        CompressedTensorsHfQuantizer._heretic_kimi_skip_compress = True
 
 
 def get_model_class(
@@ -38,10 +114,94 @@ def get_model_class(
 ) -> Type[AutoModelForImageTextToText] | Type[AutoModelForCausalLM]:
     configs = PretrainedConfig.get_config_dict(model)
 
-    if any([("vision_config" in config) for config in configs]):
-        return AutoModelForImageTextToText
-    else:
+    # PretrainedConfig.get_config_dict() returns (config_dict, kwargs).
+    # Be defensive and keep supporting older/newer return shapes.
+    config_dict = configs[0] if isinstance(configs, tuple) else configs
+
+    if not isinstance(config_dict, dict):
         return AutoModelForCausalLM
+
+    # Prefer CausalLM when remote code explicitly provides a CausalLM mapping.
+    # This is necessary for models like moonshotai/Kimi-K2.5, which include
+    # vision metadata but still expose their text backbone via AutoModelForCausalLM.
+    auto_map = config_dict.get("auto_map")
+    if isinstance(auto_map, dict) and "AutoModelForCausalLM" in auto_map:
+        if "AutoModelForImageTextToText" not in auto_map:
+            return AutoModelForCausalLM
+
+    if "vision_config" in config_dict:
+        return AutoModelForImageTextToText
+
+    return AutoModelForCausalLM
+
+
+def _force_eager_attention_config(config: Any):
+    """Recursively force eager attention on config objects and nested sub-configs."""
+    if config is None:
+        return
+
+    for key in ("_attn_implementation", "attn_implementation"):
+        with suppress(Exception):
+            setattr(config, key, "eager")
+
+    # Traverse common nested config containers (vision/text/multimodal wrappers).
+    for child_name in (
+        "vision_config",
+        "text_config",
+        "language_config",
+        "model_config",
+        "config",
+    ):
+        with suppress(Exception):
+            child = getattr(config, child_name)
+            if child is not config:
+                _force_eager_attention_config(child)
+
+
+def _patch_kimi_remote_module_if_needed(config: Any):
+    """Work around buggy MoonViT3dEncoder initialization in some Kimi releases."""
+    module_name = config.__class__.__module__
+
+    candidates: list[str] = []
+    if "." in module_name:
+        candidates.append(module_name.rsplit(".", 1)[0] + ".modeling_kimi_k25")
+    candidates.append(module_name.replace("configuration_kimi_k25", "modeling_kimi_k25"))
+    candidates.append("modeling_kimi_k25")
+
+    for modeling_module_name in dict.fromkeys(candidates):
+        with suppress(Exception):
+            modeling_module = importlib.import_module(modeling_module_name)
+
+            # 1) Patch MoonViT3dEncoder init ordering bug.
+            encoder_cls = getattr(modeling_module, "MoonViT3dEncoder", None)
+            if encoder_cls is not None and not getattr(encoder_cls, "_heretic_patched", False):
+                original_init = encoder_cls.__init__
+
+                def _patched_init(self, *args, **kwargs):
+                    # Upstream bug: self.use_deterministic_attn is read before assignment.
+                    if not hasattr(self, "use_deterministic_attn"):
+                        self.use_deterministic_attn = False
+                    return original_init(self, *args, **kwargs)
+
+                encoder_cls.__init__ = _patched_init
+                # Extra safety for attribute lookup before init execution.
+                encoder_cls.use_deterministic_attn = False
+                encoder_cls._heretic_patched = True
+
+            # 2) Patch tie_weights signature mismatch with newer Transformers,
+            # which may call tie_weights(recompute_mapping=...).
+            kimi_cls = getattr(modeling_module, "KimiK25ForConditionalGeneration", None)
+            if kimi_cls is not None and not getattr(kimi_cls, "_heretic_tie_weights_patched", False):
+                original_tie_weights = kimi_cls.tie_weights
+
+                def _patched_tie_weights(self, *args, **kwargs):
+                    return original_tie_weights(self)
+
+                kimi_cls.tie_weights = _patched_tie_weights
+                kimi_cls._heretic_tie_weights_patched = True
+
+    # Also patch compressed-tensors quantizer for Kimi loads.
+    _patch_compressed_tensors_quantizer_for_kimi()
 
 
 @dataclass
@@ -57,10 +217,59 @@ class Model:
     tokenizer: PreTrainedTokenizerBase
     peft_config: LoraConfig
 
-    def __init__(self, settings: Settings):
+    def _get_model_load_kwargs(self, model_name: str) -> dict[str, Any]:
+        kwargs: dict[str, Any] = {}
+
+        # Prefer explicit config patching because some remote models read
+        # nested config fields (e.g. vision_config._attn_implementation).
+        with suppress(Exception):
+            cfg = AutoConfig.from_pretrained(
+                model_name,
+                trust_remote_code=self.trusted_models.get(model_name),
+            )
+            _force_eager_attention_config(cfg)
+            _patch_kimi_remote_module_if_needed(cfg)
+            kwargs["config"] = cfg
+
+        if self.settings.tensor_parallel and self.distributed_state.enabled:
+            if self.settings.tensor_parallel_plan is not None:
+                kwargs["tp_plan"] = self.settings.tensor_parallel_plan
+
+        return kwargs
+
+    def _load_model(self, model_name: str, dtype: str | torch.dtype, device_map: Any, max_memory: Any, extra_kwargs: dict[str, Any]):
+        model_kwargs = self._get_model_load_kwargs(model_name)
+        return get_model_class(model_name).from_pretrained(
+            model_name,
+            dtype=dtype,
+            device_map=device_map,
+            max_memory=max_memory,
+            trust_remote_code=self.trusted_models.get(model_name),
+            **model_kwargs,
+            **extra_kwargs,
+        )
+
+    def __init__(
+        self,
+        settings: Settings,
+        distributed_state: DistributedState | None = None,
+    ):
         self.settings = settings
         self.response_prefix = ""
         self.needs_reload = False
+        self.distributed_state = (
+            distributed_state
+            if distributed_state is not None
+            else DistributedState(
+                enabled=False,
+                backend="nccl",
+                world_size=1,
+                rank=0,
+                local_rank=0,
+                master_addr="127.0.0.1",
+                master_port=29500,
+            )
+        )
 
         print()
         print(f"Loading model [bold]{settings.model}[/]...")
@@ -85,6 +294,18 @@ class Model:
             if settings.max_memory
             else None
         )
+
+        # For distributed multi-process runs, keep device placement deterministic.
+        # - With tensor parallel: let Transformers TP place shards.
+        # - Without tensor parallel: pin each process to its LOCAL_RANK GPU.
+        if self.distributed_state.enabled and self.distributed_state.world_size > 1:
+            if self.settings.tensor_parallel:
+                settings.device_map = None  # ty:ignore[assignment]
+                self.max_memory = None
+            else:
+                local_rank = int(os.getenv("LOCAL_RANK", str(self.distributed_state.local_rank)))
+                settings.device_map = {"": f"cuda:{local_rank}"}  # ty:ignore[assignment]
+
         self.trusted_models = {settings.model: settings.trust_remote_code}
 
         if self.settings.evaluate_model is not None:
@@ -102,13 +323,12 @@ class Model:
                 if quantization_config is not None:
                     extra_kwargs["quantization_config"] = quantization_config
 
-                self.model = get_model_class(settings.model).from_pretrained(
+                self.model = self._load_model(
                     settings.model,
-                    dtype=dtype,
-                    device_map=settings.device_map,
-                    max_memory=self.max_memory,
-                    trust_remote_code=self.trusted_models.get(settings.model),
-                    **extra_kwargs,
+                    dtype,
+                    settings.device_map,
+                    self.max_memory,
+                    extra_kwargs,
                 )
 
                 # If we reach this point and the model requires trust_remote_code,
@@ -131,6 +351,16 @@ class Model:
             except Exception as error:
                 self.model = None  # ty:ignore[invalid-assignment]
                 empty_cache()
+
+                # Try to reduce allocator fragmentation after CUDA OOMs.
+                if "CUDA out of memory" in str(error):
+                    if (
+                        "PYTORCH_CUDA_ALLOC_CONF" not in os.environ
+                        and "PYTORCH_ALLOC_CONF" not in os.environ
+                        and self.settings.cuda_alloc_conf is not None
+                    ):
+                        os.environ["PYTORCH_ALLOC_CONF"] = self.settings.cuda_alloc_conf
+
                 print(f"* [red]Failed[/] ({error})")
                 continue
 
@@ -248,11 +478,12 @@ class Model:
 
             # Load base model in full precision on CPU to avoid VRAM issues
             print("* Loading base model on CPU (this may take a while)...")
-            base_model = get_model_class(self.settings.model).from_pretrained(
+            base_model = self._load_model(
                 self.settings.model,
-                torch_dtype=self.model.dtype,
-                device_map="cpu",
-                trust_remote_code=self.trusted_models.get(self.settings.model),
+                self.model.dtype,
+                "cpu",
+                None,
+                {},
             )
 
             # Apply LoRA adapters to the CPU model
@@ -308,13 +539,12 @@ class Model:
         if quantization_config is not None:
             extra_kwargs["quantization_config"] = quantization_config
 
-        self.model = get_model_class(self.settings.model).from_pretrained(
+        self.model = self._load_model(
             self.settings.model,
-            dtype=dtype,
-            device_map=self.settings.device_map,
-            max_memory=self.max_memory,
-            trust_remote_code=self.trusted_models.get(self.settings.model),
-            **extra_kwargs,
+            dtype,
+            self.settings.device_map,
+            self.max_memory,
+            extra_kwargs,
         )
 
         self._apply_lora()
@@ -328,12 +558,22 @@ class Model:
         if isinstance(model, PeftModel):
             model = model.base_model.model
 
-        # Most multimodal models.
+        # Most multimodal models where a CausalLM sits below model.language_model.
         with suppress(Exception):
             return model.model.language_model.layers
 
+        # Some multimodal wrappers expose language_model at the top level.
+        with suppress(Exception):
+            return model.language_model.model.layers
+
+        with suppress(Exception):
+            return model.language_model.layers
+
         # Text-only models.
-        return model.model.layers
+        with suppress(Exception):
+            return model.model.layers
+
+        raise Exception("Unable to locate transformer layers for this architecture")
 
     def get_layer_modules(self, layer_index: int) -> dict[str, list[Module]]:
         layer = self.get_layers()[layer_index]
@@ -369,6 +609,11 @@ class Model:
         with suppress(Exception):
             for expert in layer.mlp.experts:  # ty:ignore[possibly-missing-attribute, not-iterable]
                 try_add("mlp.down_proj", expert.down_proj)  # ty:ignore[possibly-missing-attribute]
+
+        # DeepSeek/Kimi-family MoE models can expose shared experts in addition
+        # to routed experts.
+        with suppress(Exception):
+            try_add("mlp.down_proj", layer.mlp.shared_experts.down_proj)  # ty:ignore[possibly-missing-attribute]
 
         # Phi-3.5-MoE (and possibly others).
         with suppress(Exception):

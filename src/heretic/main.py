@@ -52,6 +52,7 @@ from rich.traceback import install
 
 from .analyzer import Analyzer
 from .config import QuantizationMethod, Settings
+from .distributed import destroy_distributed, get_distributed_state, init_distributed
 from .evaluator import Evaluator
 from .model import AbliterationParameters, Model, get_model_class
 from .utils import (
@@ -144,21 +145,6 @@ def obtain_merge_strategy(settings: Settings) -> str | None:
 
 
 def run():
-    # Enable expandable segments to reduce memory fragmentation on multi-GPU setups.
-    if (
-        "PYTORCH_ALLOC_CONF" not in os.environ
-        and "PYTORCH_CUDA_ALLOC_CONF" not in os.environ
-    ):
-        os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
-
-    # Modified "Pagga" font from https://budavariam.github.io/asciiart-text/
-    print(f"[cyan]█░█░█▀▀░█▀▄░█▀▀░▀█▀░█░█▀▀[/]  v{version('heretic-llm')}")
-    print("[cyan]█▀█░█▀▀░█▀▄░█▀▀░░█░░█░█░░[/]")
-    print(
-        "[cyan]▀░▀░▀▀▀░▀░▀░▀▀▀░░▀░░▀░▀▀▀[/]  [blue underline]https://github.com/p-e-w/heretic[/]"
-    )
-    print()
-
     if (
         # There is at least one argument (argv[0] is the program name).
         len(sys.argv) > 1
@@ -185,6 +171,46 @@ def run():
             "Run [bold]heretic --help[/] or see [bold]config.default.toml[/] for details about configuration parameters."
         )
         return
+
+    # Enable allocator tuning early to reduce memory fragmentation.
+    if (
+        settings.cuda_alloc_conf is not None
+        and "PYTORCH_ALLOC_CONF" not in os.environ
+        and "PYTORCH_CUDA_ALLOC_CONF" not in os.environ
+    ):
+        os.environ["PYTORCH_ALLOC_CONF"] = settings.cuda_alloc_conf
+
+    distributed_state = get_distributed_state(
+        enabled=settings.distributed,
+        backend=settings.distributed_backend,
+    )
+
+    if distributed_state.enabled:
+        settings.distributed = True
+        settings.distributed_world_size = distributed_state.world_size
+        settings.distributed_rank = distributed_state.rank
+        settings.distributed_local_rank = distributed_state.local_rank
+        settings.distributed_master_addr = distributed_state.master_addr
+        settings.distributed_master_port = distributed_state.master_port
+        init_distributed(distributed_state)
+
+    # Modified "Pagga" font from https://budavariam.github.io/asciiart-text/
+    print(f"[cyan]█░█░█▀▀░█▀▄░█▀▀░▀█▀░█░█▀▀[/]  v{version('heretic-llm')}")
+    print("[cyan]█▀█░█▀▀░█▀▄░█▀▀░░█░░█░█░░[/]")
+    print(
+        "[cyan]▀░▀░▀▀▀░▀░▀░▀▀▀░░▀░░▀░▀▀▀[/]  [blue underline]https://github.com/p-e-w/heretic[/]"
+    )
+    print()
+
+    if distributed_state.enabled:
+        print(
+            "Distributed mode: "
+            f"backend=[bold]{distributed_state.backend}[/], "
+            f"world_size=[bold]{distributed_state.world_size}[/], "
+            f"rank=[bold]{distributed_state.rank}[/], "
+            f"local_rank=[bold]{distributed_state.local_rank}[/]"
+        )
+        print()
 
     # Adapted from https://github.com/huggingface/accelerate/blob/main/src/accelerate/commands/env.py
     if torch.cuda.is_available():
@@ -320,12 +346,25 @@ def run():
         )
 
         print()
-        choice = prompt_select("How would you like to proceed?", choices)
+        if distributed_state.enabled:
+            choice = "continue"
+            print("Distributed mode: automatically continuing existing study.")
+        else:
+            choice = prompt_select("How would you like to proceed?", choices)
 
         if choice == "continue":
             settings = Settings.model_validate_json(
                 existing_study.user_attrs["settings"]
             )
+            # Preserve distributed runtime parameters from the active launch
+            # environment (torchrun) after restoring study settings.
+            settings.distributed = distributed_state.enabled
+            settings.distributed_backend = distributed_state.backend
+            settings.distributed_world_size = distributed_state.world_size
+            settings.distributed_rank = distributed_state.rank
+            settings.distributed_local_rank = distributed_state.local_rank
+            settings.distributed_master_addr = distributed_state.master_addr
+            settings.distributed_master_port = distributed_state.master_port
         elif choice == "restart":
             os.unlink(study_checkpoint_file)
             backend = JournalFileBackend(study_checkpoint_file, lock_obj=lock_obj)
@@ -333,7 +372,7 @@ def run():
         elif choice is None or choice == "":
             return
 
-    model = Model(settings)
+    model = Model(settings, distributed_state=distributed_state)
     print()
     print_memory_usage()
 
@@ -637,6 +676,14 @@ def run():
 
     if count_completed_trials() == settings.n_trials:
         study.set_user_attr("finished", True)
+
+    if distributed_state.enabled:
+        print()
+        print(
+            "Distributed run finished optimization phase. "
+            "Interactive trial actions are disabled in distributed mode."
+        )
+        return
 
     while True:
         # If no trials at all have been evaluated, the study must have been stopped
@@ -1062,3 +1109,5 @@ def main():
             print("[red]Shutting down...[/]")
         else:
             raise
+    finally:
+        destroy_distributed()
