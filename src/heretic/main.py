@@ -1111,3 +1111,7 @@ def main():
             raise
     finally:
         destroy_distributed()
+
+
+if __name__ == "__main__":
+    main()
