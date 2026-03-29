@@ -215,15 +215,28 @@ def run():
     # Adapted from https://github.com/huggingface/accelerate/blob/main/src/accelerate/commands/env.py
     if torch.cuda.is_available():
         count = torch.cuda.device_count()
-        total_vram = sum(torch.cuda.mem_get_info(i)[1] for i in range(count))
-        print(
-            f"Detected [bold]{count}[/] CUDA device(s) ({total_vram / (1024**3):.2f} GB total VRAM):"
-        )
-        for i in range(count):
+        if distributed_state.enabled and distributed_state.world_size > 1:
+            # In distributed mode each process should avoid touching all local devices,
+            # because querying every GPU can create CUDA contexts and waste VRAM.
+            i = torch.cuda.current_device()
             vram = torch.cuda.mem_get_info(i)[1] / (1024**3)
+            print(f"Detected [bold]{count}[/] CUDA device(s) on this node.")
+            print(
+                f"Using local CUDA device [bold]{i}[/] for rank [bold]{distributed_state.rank}[/]:"
+            )
             print(
                 f"* GPU {i}: [bold]{torch.cuda.get_device_name(i)}[/] ({vram:.2f} GB)"
             )
+        else:
+            total_vram = sum(torch.cuda.mem_get_info(i)[1] for i in range(count))
+            print(
+                f"Detected [bold]{count}[/] CUDA device(s) ({total_vram / (1024**3):.2f} GB total VRAM):"
+            )
+            for i in range(count):
+                vram = torch.cuda.mem_get_info(i)[1] / (1024**3)
+                print(
+                    f"* GPU {i}: [bold]{torch.cuda.get_device_name(i)}[/] ({vram:.2f} GB)"
+                )
     elif is_xpu_available():
         count = torch.xpu.device_count()
         print(f"Detected [bold]{count}[/] XPU device(s):")
