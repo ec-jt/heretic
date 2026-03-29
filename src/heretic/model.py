@@ -331,6 +331,12 @@ class Model:
                     extra_kwargs,
                 )
 
+                if self.distributed_state.enabled and self.settings.tensor_parallel:
+                    # Large TP loads can leave significant unallocated memory in the
+                    # CUDA caching allocator. Release cached segments before the smoke
+                    # generation step to reduce false OOMs during dtype probing.
+                    empty_cache()
+
                 # If we reach this point and the model requires trust_remote_code,
                 # either the user accepted, or settings.trust_remote_code is True.
                 if self.trusted_models.get(settings.model) is None:
