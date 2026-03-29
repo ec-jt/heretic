@@ -2,6 +2,8 @@
 # Copyright (C) 2025-2026  Philipp Emanuel Weidmann <pew@worldwidemann.com> + contributors
 
 import os
+import ipaddress
+import subprocess
 from dataclasses import dataclass
 from contextlib import suppress
 
@@ -52,6 +54,54 @@ def init_distributed(state: DistributedState):
     if state.world_size <= 1:
         return
 
+    def infer_interface_for_master(master_addr: str) -> str | None:
+        try:
+            master_ip = ipaddress.ip_address(master_addr)
+        except ValueError:
+            return None
+
+        try:
+            result = subprocess.run(
+                ["ip", "-o", "-4", "addr", "show"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except Exception:
+            return None
+
+        if result.returncode != 0:
+            return None
+
+        for line in result.stdout.splitlines():
+            parts = line.split()
+            if "inet" not in parts:
+                continue
+
+            ifname = parts[1]
+            if ifname == "lo":
+                continue
+
+            cidr = parts[parts.index("inet") + 1]
+            try:
+                network = ipaddress.ip_interface(cidr).network
+            except ValueError:
+                continue
+
+            if master_ip in network:
+                return ifname
+
+        return None
+
+    # If not explicitly set, select a network interface that can route to MASTER_ADDR.
+    ifname = os.getenv("HERETIC_DISTRIBUTED_IFNAME")
+    if not ifname:
+        ifname = infer_interface_for_master(state.master_addr)
+
+    if ifname:
+        os.environ.setdefault("GLOO_SOCKET_IFNAME", ifname)
+        os.environ.setdefault("NCCL_SOCKET_IFNAME", ifname)
+
     if dist.is_available() and not dist.is_initialized():
         if torch.cuda.is_available():
             torch.cuda.set_device(state.local_rank)
@@ -73,4 +123,3 @@ def destroy_distributed():
     with suppress(Exception):
         if dist.is_available() and dist.is_initialized():
             dist.destroy_process_group()
-
